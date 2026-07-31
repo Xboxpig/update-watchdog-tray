@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+set -u
+
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/update-watchdog"
+readonly CC_STATE="$STATE_DIR/cc-switch.notified"
+readonly CODEX_STATE="$STATE_DIR/codex-prerelease.notified"
+readonly STATUS_FILE="$STATE_DIR/status"
+readonly CC_RELEASE_API="https://api.github.com/repos/farion1231/cc-switch/releases/latest"
+readonly CODEX_REGISTRY_API="https://registry.npmjs.org/-/package/@openai%2Fcodex/dist-tags"
+
+mkdir -p "$STATE_DIR"
+
+notify_update() {
+    local app_name=$1
+    local installed=$2
+    local available=$3
+    local command=$4
+    local icon=$5
+
+    notify-send \
+        --app-name="Update Watchdog" \
+        --icon="$icon" \
+        --urgency=normal \
+        "$app_name 有新版本" \
+        "已安装：$installed\n可更新：$available\n更新命令：$command"
+}
+
+check_cc_switch() {
+    local installed available notified
+
+    installed=$(pacman -Q cc-switch-bin 2>/dev/null | awk '{print $2}') || {
+        echo "cc-switch-bin is not installed" >&2
+        return 1
+    }
+    # Remove the Arch package release suffix, for example 3.19.0-1 -> 3.19.0.
+    installed=${installed%-[0-9]*}
+    CC_INSTALLED=$installed
+    available=$(curl --fail --silent --show-error --location \
+        --retry 3 --retry-all-errors --connect-timeout 10 --max-time 60 "$CC_RELEASE_API" |
+        jq -er '.tag_name | sub("^v"; "")') || return 1
+    CC_AVAILABLE=$available
+    notified=$(cat "$CC_STATE" 2>/dev/null || true)
+
+    if (( $(vercmp "$available" "$installed") > 0 )); then
+        if [[ $notified != "$available" ]]; then
+            notify_update "CC Switch" "$installed" "$available" \
+                "yay -Syu cc-switch-bin" "cc-switch"
+            printf '%s\n' "$available" >"$CC_STATE"
+        fi
+    else
+        : >"$CC_STATE"
+    fi
+}
+
+check_codex_prerelease() {
+    local installed available notified registry candidate codex_bin
+
+    codex_bin=$(command -v codex 2>/dev/null || true)
+    if [[ -z $codex_bin ]]; then
+        for candidate in \
+            "$HOME/.local/share/pnpm/bin/codex" \
+            "$HOME/.local/share/pnpm/codex"; do
+            if [[ -x $candidate ]]; then
+                codex_bin=$candidate
+                break
+            fi
+        done
+    fi
+    [[ -n $codex_bin ]] || {
+        echo "codex is not installed" >&2
+        return 1
+    }
+    installed=$("$codex_bin" --version 2>/dev/null | awk '{print $NF}') || return 1
+    CODEX_INSTALLED=$installed
+    registry=$(curl --fail --silent --show-error --location \
+        --retry 3 --retry-all-errors --connect-timeout 10 --max-time 60 \
+        "$CODEX_REGISTRY_API") || return 1
+    available=""
+    while IFS= read -r candidate; do
+        if [[ -z $available ]] || (( $(vercmp "$candidate" "$available") > 0 )); then
+            available=$candidate
+        fi
+    done < <(jq -r '
+        to_entries[]
+        | select(.key | test("^(alpha|beta|rc|next|canary)$"))
+        | .value
+        | select(test("-(alpha|beta|rc|next|canary)([.-]|$)"))
+    ' <<<"$registry")
+    [[ -n $available ]] || {
+        echo "no active Codex pre-release channel found" >&2
+        return 1
+    }
+    CODEX_AVAILABLE=$available
+    notified=$(cat "$CODEX_STATE" 2>/dev/null || true)
+
+    if (( $(vercmp "$available" "$installed") > 0 )); then
+        if [[ $notified != "$available" ]]; then
+            notify_update "OpenAI Codex pre-release" "$installed" "$available" \
+                "pnpm install -g @openai/codex@$available" "utilities-terminal"
+            printf '%s\n' "$available" >"$CODEX_STATE"
+        fi
+    else
+        : >"$CODEX_STATE"
+    fi
+}
+
+CC_INSTALLED="unknown"
+CC_AVAILABLE="unknown"
+CODEX_INSTALLED="unknown"
+CODEX_AVAILABLE="unknown"
+status=0
+check_cc_switch || status=1
+check_codex_prerelease || status=1
+
+status_tmp="$STATUS_FILE.tmp"
+{
+    printf 'cc_switch\t%s\t%s\n' "$CC_INSTALLED" "$CC_AVAILABLE"
+    printf 'codex_prerelease\t%s\t%s\n' "$CODEX_INSTALLED" "$CODEX_AVAILABLE"
+    printf 'checked_at\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+} >"$status_tmp"
+mv "$status_tmp" "$STATUS_FILE"
+
+exit "$status"
