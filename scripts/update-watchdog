@@ -4,9 +4,11 @@ set -u
 
 readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/update-watchdog"
 readonly CC_STATE="$STATE_DIR/cc-switch.notified"
+readonly CHATGPT_STATE="$STATE_DIR/chatgpt-desktop.notified"
 readonly CODEX_STATE="$STATE_DIR/codex-prerelease.notified"
 readonly STATUS_FILE="$STATE_DIR/status"
 readonly CC_RELEASE_API="https://api.github.com/repos/farion1231/cc-switch/releases/latest"
+readonly CHATGPT_PACKAGES_INDEX="https://persistent.oaistatic.com/codex-app-prod/linux/deb/dists/stable/main/binary-amd64/Packages"
 readonly CODEX_REGISTRY_API="https://registry.npmjs.org/-/package/@openai%2Fcodex/dist-tags"
 
 mkdir -p "$STATE_DIR"
@@ -15,7 +17,7 @@ notify_update() {
     local app_name=$1
     local installed=$2
     local available=$3
-    local command=$4
+    local action=$4
     local icon=$5
 
     notify-send \
@@ -23,7 +25,7 @@ notify_update() {
         --icon="$icon" \
         --urgency=normal \
         "$app_name 有新版本" \
-        "已安装：$installed\n可更新：$available\n更新命令：$command"
+        "已安装：$installed\n可更新：$available\n操作：$action"
 }
 
 check_cc_switch() {
@@ -45,11 +47,56 @@ check_cc_switch() {
     if (( $(vercmp "$available" "$installed") > 0 )); then
         if [[ $notified != "$available" ]]; then
             notify_update "CC Switch" "$installed" "$available" \
-                "yay -Syu cc-switch-bin" "cc-switch"
+                "在 Update Watchdog 托盘菜单中选择“更新 CC Switch...”" "cc-switch"
             printf '%s\n' "$available" >"$CC_STATE"
         fi
     else
         : >"$CC_STATE"
+    fi
+}
+
+check_chatgpt_desktop() {
+    local installed available notified packages_index
+
+    installed=$(pacman -Q chatgpt-desktop 2>/dev/null | awk '{print $2}') || {
+        echo "chatgpt-desktop is not installed" >&2
+        return 1
+    }
+    installed=${installed%-[0-9]*}
+    CHATGPT_INSTALLED=$installed
+    packages_index=$(curl --fail --silent --show-error --location \
+        --retry 3 --retry-all-errors --connect-timeout 10 --max-time 60 \
+        --proto '=https' --tlsv1.2 "$CHATGPT_PACKAGES_INDEX") || return 1
+    available=$(awk '
+        BEGIN { RS = ""; FS = "\n" }
+        {
+            package = architecture = version = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^Package: /) package = substr($i, 10)
+                else if ($i ~ /^Architecture: /) architecture = substr($i, 15)
+                else if ($i ~ /^Version: /) version = substr($i, 10)
+            }
+            if (package == "chatgpt" && architecture == "amd64") {
+                print version
+                exit
+            }
+        }
+    ' <<<"$packages_index")
+    [[ $available =~ ^[0-9]+(\.[0-9]+)+$ ]] || {
+        echo "invalid ChatGPT desktop version in package index: $available" >&2
+        return 1
+    }
+    CHATGPT_AVAILABLE=$available
+    notified=$(cat "$CHATGPT_STATE" 2>/dev/null || true)
+
+    if (( $(vercmp "$available" "$installed") > 0 )); then
+        if [[ $notified != "$available" ]]; then
+            notify_update "ChatGPT Desktop" "$installed" "$available" \
+                "在 Update Watchdog 托盘菜单中选择“更新 ChatGPT Desktop...”" "chatgpt"
+            printf '%s\n' "$available" >"$CHATGPT_STATE"
+        fi
+    else
+        : >"$CHATGPT_STATE"
     fi
 }
 
@@ -107,15 +154,19 @@ check_codex_prerelease() {
 
 CC_INSTALLED="unknown"
 CC_AVAILABLE="unknown"
+CHATGPT_INSTALLED="unknown"
+CHATGPT_AVAILABLE="unknown"
 CODEX_INSTALLED="unknown"
 CODEX_AVAILABLE="unknown"
 status=0
 check_cc_switch || status=1
+check_chatgpt_desktop || status=1
 check_codex_prerelease || status=1
 
 status_tmp="$STATUS_FILE.tmp"
 {
     printf 'cc_switch\t%s\t%s\n' "$CC_INSTALLED" "$CC_AVAILABLE"
+    printf 'chatgpt_desktop\t%s\t%s\n' "$CHATGPT_INSTALLED" "$CHATGPT_AVAILABLE"
     printf 'codex_prerelease\t%s\t%s\n' "$CODEX_INSTALLED" "$CODEX_AVAILABLE"
     printf 'checked_at\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
 } >"$status_tmp"

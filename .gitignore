@@ -1,3 +1,4 @@
 /build/
+/graphify-out/
 *.o
 compile_commands.json

@@ -1,5 +1,5 @@
 [Unit]
-Description=Native update watchdog tray for CC Switch and OpenAI Codex pre-releases
+Description=Native update watchdog tray for CC Switch, ChatGPT Desktop, and OpenAI Codex pre-releases
 After=network-online.target plasma-workspace.target
 PartOf=plasma-workspace.target
 

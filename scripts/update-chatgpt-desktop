@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+
+# Builds a locally managed pacman package from OpenAI's official Linux release.
+# stdout is a tab-separated event stream consumed by update-watchdog-tray.
+set -u
+set -o pipefail
+
+readonly PACKAGE_NAME="chatgpt-desktop"
+readonly PACKAGES_INDEX_URL="https://persistent.oaistatic.com/codex-app-prod/linux/deb/dists/stable/main/binary-amd64/Packages"
+readonly RELEASE_ROOT="https://persistent.oaistatic.com/codex-app-prod/linux/deb"
+readonly APPMENU_MODULE="/usr/lib/gtk-3.0/modules/libappmenu-gtk-module.so"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/update-watchdog"
+readonly DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/update-watchdog"
+readonly TEMPLATE_PATH="$DATA_DIR/PKGBUILD.chatgpt.in"
+readonly LAUNCHER_PATH="$DATA_DIR/chatgpt-launcher.sh"
+
+work_dir=""
+log_file=""
+
+sanitize() {
+    local value=${1-}
+    value=${value//$'\t'/ }
+    value=${value//$'\r'/ }
+    value=${value//$'\n'/ }
+    printf '%s' "$value"
+}
+
+event() {
+    local type=$1
+    shift
+    printf '%s' "$type"
+    local field
+    for field in "$@"; do
+        printf '\t%s' "$(sanitize "$field")"
+    done
+    printf '\n'
+}
+
+progress() {
+    event PROGRESS "$1" "$2" "$3" "$4"
+}
+
+log() {
+    event LOG "$1" "$2"
+}
+
+warning() {
+    event WARNING "$1" "$2" "$3"
+}
+
+fail() {
+    event ERROR "$1" "$2" "$3"
+    exit 1
+}
+
+tail_log() {
+    tail -n 12 "$log_file" 2>/dev/null | tr '\n\t\r' '   '
+}
+
+fail_from_log() {
+    local code=$1
+    local title=$2
+    local detail
+    detail=$(tail_log)
+    [[ -n $detail ]] || detail="命令未返回可用诊断信息。"
+    fail "$code" "$title" "$detail"
+}
+
+cleanup() {
+    if [[ -n $work_dir && -d $work_dir ]]; then
+        rm -rf -- "$work_dir"
+    fi
+}
+
+cancelled() {
+    fail E_CANCELLED "更新已取消" "取消发生在可安全中断的阶段；未安装新软件包。"
+}
+
+trap cleanup EXIT
+trap cancelled INT TERM
+
+require_command() {
+    local command=$1
+    command -v "$command" >/dev/null 2>&1 ||
+        fail E_PRECONDITION "缺少升级依赖" "未找到必需命令：$command"
+}
+
+run_logged() {
+    "$@" >>"$log_file" 2>&1
+}
+
+release_record() {
+    awk '
+        BEGIN { RS = ""; FS = "\n" }
+        {
+            package = architecture = version = filename = checksum = size = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^Package: /) package = substr($i, 10)
+                else if ($i ~ /^Architecture: /) architecture = substr($i, 15)
+                else if ($i ~ /^Version: /) version = substr($i, 10)
+                else if ($i ~ /^Filename: /) filename = substr($i, 11)
+                else if ($i ~ /^SHA256: /) checksum = substr($i, 9)
+                else if ($i ~ /^Size: /) size = substr($i, 7)
+            }
+            if (package == "chatgpt" && architecture == "amd64") {
+                printf "%s\t%s\t%s\t%s\n", version, filename, checksum, size
+                exit
+            }
+        }
+    '
+}
+
+main() {
+    local command cache_dir installed packages_index record target filename checksum asset_size
+    local asset_url asset_name launcher_checksum comparison package_file installed_after
+    local available_kib required_kib package_binary
+    local -a privilege_command
+
+    progress 2 "正在检查环境" "验证本地打包、补丁和安装工具。" true
+    for command in ar awk bsdtar curl df flock grep install makepkg mkdir mktemp pacman patchelf readelf sed sha256sum stat tail tr vercmp; do
+        require_command "$command"
+    done
+    [[ -r $APPMENU_MODULE ]] ||
+        fail E_PRECONDITION "缺少 appmenu 防崩溃依赖" "$APPMENU_MODULE"
+    [[ -r $TEMPLATE_PATH && -r $LAUNCHER_PATH ]] ||
+        fail E_TEMPLATE "找不到 ChatGPT 本地打包资源" "$TEMPLATE_PATH 或 $LAUNCHER_PATH"
+
+    mkdir -p "$STATE_DIR" || fail E_PRECONDITION "无法创建状态目录" "$STATE_DIR"
+    log_file="$STATE_DIR/chatgpt-desktop-upgrade.log"
+    : >"$log_file" || fail E_PRECONDITION "无法写入升级日志" "$log_file"
+
+    exec 9>"$STATE_DIR/package-upgrade.lock" ||
+        fail E_PRECONDITION "无法创建升级锁" "$STATE_DIR/package-upgrade.lock"
+    flock -n 9 || fail E_CONCURRENT "已有软件升级正在进行" "请等待另一个 Update Watchdog 升级任务完成。"
+
+    installed=$(pacman -Q "$PACKAGE_NAME" 2>>"$log_file" | awk '{print $2}') ||
+        fail_from_log E_INSTALLED_VERSION "无法读取已安装版本"
+    installed=${installed%-[0-9]*}
+    [[ $installed =~ ^[0-9]+(\.[0-9]+)+$ ]] ||
+        fail E_INSTALLED_VERSION "已安装版本格式无效" "$installed"
+
+    progress 8 "正在获取发布信息" "检查 OpenAI 官方 Linux stable 软件源。" true
+    packages_index=$(curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+        --connect-timeout 10 --max-time 60 --proto '=https' --tlsv1.2 \
+        "$PACKAGES_INDEX_URL" 2>>"$log_file") ||
+        fail_from_log E_RELEASE_METADATA "无法获取 ChatGPT 发布信息"
+    record=$(release_record <<<"$packages_index") ||
+        fail_from_log E_RELEASE_METADATA "无法解析 ChatGPT 发布信息"
+    IFS=$'\t' read -r target filename checksum asset_size <<<"$record"
+
+    [[ $target =~ ^[0-9]+(\.[0-9]+)+$ ]] ||
+        fail E_RELEASE_VERSION "发布版本信息无效" "$target"
+    [[ $filename =~ ^pool/main/c/chatgpt/chatgpt_[0-9.]+_amd64\.deb$ &&
+       $checksum =~ ^[0-9a-f]{64}$ && $asset_size =~ ^[0-9]+$ ]] ||
+        fail E_RELEASE_ASSET "官方软件源中的发布资产信息无效" "$filename"
+    [[ $filename == *"chatgpt_${target}_amd64.deb" ]] ||
+        fail E_RELEASE_ASSET "发布资产与版本不匹配" "$filename"
+
+    comparison=$(vercmp "$target" "$installed" 2>>"$log_file") ||
+        fail_from_log E_RELEASE_VERSION "无法比较版本"
+    if (( comparison <= 0 )); then
+        progress 100 "已是最新版本" "ChatGPT Desktop 已安装 $installed。" false
+        event RESULT already-current "$installed" "当前版本已不低于 OpenAI stable 发布版 $target。"
+        return 0
+    fi
+
+    cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/update-watchdog"
+    mkdir -p "$cache_dir" || fail E_PRECONDITION "无法创建缓存目录" "$cache_dir"
+    available_kib=$(df -Pk "$cache_dir" | awk 'NR == 2 {print $4}')
+    required_kib=$(( (asset_size * 6 + 1023) / 1024 ))
+    [[ $available_kib =~ ^[0-9]+$ && $available_kib -ge $required_kib ]] ||
+        fail E_PRECONDITION "可用磁盘空间不足" "构建至少需要约 $((required_kib / 1024)) MiB 可用空间。"
+    work_dir=$(mktemp -d "$cache_dir/chatgpt-desktop.XXXXXX") ||
+        fail E_PRECONDITION "无法创建临时构建目录" "请检查磁盘空间和缓存目录权限。"
+
+    asset_name="chatgpt_${target}_amd64.deb"
+    asset_url="$RELEASE_ROOT/$filename"
+    progress 20 "正在下载更新" "下载 ChatGPT Desktop $target 官方安装包（$((asset_size / 1024 / 1024)) MiB）。" true
+    if ! run_logged curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+        --connect-timeout 10 --max-time 900 --proto '=https' --tlsv1.2 \
+        --output "$work_dir/$asset_name" "$asset_url"; then
+        fail_from_log E_DOWNLOAD "下载官方安装包失败"
+    fi
+
+    progress 42 "正在验证安装包" "核对 OpenAI 软件源提供的 SHA-256 和文件大小。" true
+    [[ $(stat -c '%s' "$work_dir/$asset_name" 2>>"$log_file") == "$asset_size" ]] ||
+        fail E_CHECKSUM "安装包大小校验失败" "下载结果与官方软件源元数据不一致。"
+    printf '%s  %s\n' "$checksum" "$asset_name" >"$work_dir/SHA256SUMS"
+    if ! (cd "$work_dir" && run_logged sha256sum --check --status SHA256SUMS); then
+        fail_from_log E_CHECKSUM "安装包校验失败"
+    fi
+    if ! run_logged bsdtar -tf "$work_dir/$asset_name"; then
+        fail_from_log E_ARCHIVE "安装包结构无效"
+    fi
+
+    launcher_checksum=$(sha256sum "$LAUNCHER_PATH" | awk '{print $1}')
+    install -m 755 "$LAUNCHER_PATH" "$work_dir/chatgpt-launcher.sh" ||
+        fail E_TEMPLATE "无法准备 ChatGPT 启动器" "$LAUNCHER_PATH"
+    if ! sed -e "s/@PKGVER@/$target/g" -e "s/@SHA256@/$checksum/g" \
+        -e "s/@LAUNCHER_SHA256@/$launcher_checksum/g" \
+        "$TEMPLATE_PATH" >"$work_dir/PKGBUILD"; then
+        fail E_TEMPLATE "无法生成 ChatGPT 本地打包配方" "$TEMPLATE_PATH"
+    fi
+
+    progress 58 "正在构建本地软件包" "生成带 appmenu 防崩溃补丁的 pacman 软件包。" true
+    if ! (cd "$work_dir" && run_logged makepkg -f); then
+        fail_from_log E_BUILD "构建 ChatGPT 本地软件包失败"
+    fi
+    package_file="$work_dir/${PACKAGE_NAME}-${target}-2-x86_64.pkg.tar.zst"
+    package_binary="$work_dir/pkg/$PACKAGE_NAME/usr/lib/chatgpt/ChatGPT"
+    [[ -f $package_file && -x $package_binary ]] ||
+        fail E_BUILD "未生成预期的软件包" "$package_file"
+
+    progress 72 "正在验证 appmenu 补丁" "安装前确认 Electron 主进程固定加载 appmenu 模块。" true
+    if ! readelf -d "$package_binary" 2>>"$log_file" | grep -Fq "$APPMENU_MODULE"; then
+        fail E_PATCH "appmenu 防崩溃补丁缺失" "拒绝安装未包含 DT_NEEDED 补丁的软件包。"
+    fi
+
+    progress 78 "正在安装更新" "系统可能请求管理员授权；此阶段不能安全取消。" false
+    if sudo -n true >/dev/null 2>&1; then
+        privilege_command=(sudo -n pacman -U --noconfirm "$package_file")
+    elif command -v pkexec >/dev/null 2>&1; then
+        privilege_command=(pkexec /usr/bin/pacman -U --noconfirm "$package_file")
+    else
+        fail E_AUTH "需要管理员授权" "请先在终端运行 sudo -v，然后重试升级。"
+    fi
+    if ! run_logged "${privilege_command[@]}"; then
+        if grep -qiE 'authentication|authorization|not authorized|password is required' "$log_file"; then
+            fail_from_log E_AUTH "管理员授权被拒绝或取消"
+        fi
+        fail_from_log E_INSTALL "pacman 安装失败"
+    fi
+
+    progress 94 "正在验证安装结果" "确认版本、文件完整性和 appmenu 动态依赖。" false
+    installed_after=$(pacman -Q "$PACKAGE_NAME" 2>>"$log_file" | awk '{print $2}') ||
+        fail_from_log E_POST_INSTALL "安装后无法读取版本"
+    [[ $installed_after == "${target}-2" ]] ||
+        fail E_POST_INSTALL "安装后的版本不符合预期" "预期 ${target}-2，实际 $installed_after。"
+    if ! run_logged env LC_ALL=C pacman -Qkk "$PACKAGE_NAME"; then
+        fail_from_log E_POST_INSTALL "安装后的文件完整性检查失败"
+    fi
+    if ! readelf -d /usr/lib/chatgpt/ChatGPT 2>>"$log_file" | grep -Fq "$APPMENU_MODULE"; then
+        fail E_POST_INSTALL "安装后的 appmenu 补丁校验失败" "请勿重启 ChatGPT；已安装文件缺少所需 DT_NEEDED。"
+    fi
+
+    if grep -qiE 'failed to create snapshot|failed to create subvolume snapshot' "$log_file"; then
+        warning W_SYSTEM_HOOK "系统快照钩子未成功" "ChatGPT 已安装，但 Timeshift Btrfs 快照未创建；请单独检查 Timeshift。"
+    fi
+    progress 100 "更新已准备完成" "ChatGPT Desktop $target 已由 pacman 管理，并保留 appmenu 补丁。" false
+    event RESULT success "$target" "更新已安装。请从应用菜单重启 ChatGPT 以载入新版本。"
+}
+
+main "$@"
