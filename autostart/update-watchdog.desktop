@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Update Watchdog
+Comment=Start the Update Watchdog tray service with KDE Plasma
+Exec=/usr/bin/systemctl --user start update-watchdog.service
+Icon=software-updates-inactive
+Terminal=false
+OnlyShowIn=KDE;
+X-KDE-autostart-after=panel
